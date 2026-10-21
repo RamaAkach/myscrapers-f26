@@ -3,8 +3,11 @@
 # Every hour (:25) this function:
 #   1. loads the model you trained in Colab:   gs://<bucket>/models/model.joblib  (+ models/model_card.json)
 #   2. reads your master table:                gs://<bucket>/structured/datasets/listings_master.csv
+#      (or the table named in your model card's "data_key", e.g. listings_master_llm.csv for a Gemini model)
 #   3. predicts every car this model version has not predicted yet
-#   4. computes SHAP values for those predictions (summed back to year / mileage / make / model)
+#   4. computes SHAP values for those predictions (summed back to each original feature)
+# Which features? The "features" list in your model card (Lab 4: year, mileage, make, model). A midterm model
+# trained on Gemini fields just lists more features; nothing here needs editing.
 #   5. appends both to:                        gs://<bucket>/structured/preds_lab4/preds_master.csv
 #                                              gs://<bucket>/structured/preds_lab4/shap_master.csv
 # No model uploaded yet? It returns {"status": "no_model"} and does nothing (safe to deploy before Lab 4).
@@ -34,16 +37,17 @@ MAX_PER_RUN_OTHER = int(os.getenv("MAX_PER_RUN_OTHER", "40"))   # sampled (Kerne
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("shap").setLevel(logging.WARNING)   # KernelExplainer logs every row at INFO
 
-FEATURES = ["year", "mileage", "make", "model"]
+FEATURES = ["year", "mileage", "make", "model"]      # default, used when the model card has no "features" list
+NUMERIC = ["year", "mileage"]                         # every other feature is treated as text
 NICKNAMES = {"chevy": "chevrolet", "vw": "volkswagen", "mercedes": "mercedes-benz", "benz": "mercedes-benz"}
 
 
 # -------------------- the SAME cleaning the Lab 4 notebook uses --------------------
-def clean_cars(df: pd.DataFrame) -> pd.DataFrame:
+def clean_cars(df: pd.DataFrame, text_cols=("make", "model")) -> pd.DataFrame:
     out = df.copy()
     for col in ["price", "year", "mileage"]:
         out[col] = pd.to_numeric(out[col].astype(str).str.replace(r"[^\d.]+", "", regex=True), errors="coerce")
-    for col in ["make", "model"]:
+    for col in text_cols:
         out[col] = out[col].astype(str).str.strip().str.lower()
         out.loc[out[col].isin(["", "nan", "none"]), col] = np.nan
     out["make"] = out["make"].replace(NICKNAMES)
@@ -51,19 +55,22 @@ def clean_cars(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # -------------------- the SAME SHAP helper the Lab 4 notebook uses --------------------
-def original_feature(transformed_name: str) -> str:
+def original_feature(transformed_name: str, text_cols=("make", "model")) -> str:
     name = transformed_name.split("__", 1)[-1]
-    for col in ["make", "model"]:
-        if name.startswith(col + "_"):
-            return col
+    owner = None
+    for col in text_cols:                      # longest matching name wins ("model" vs "model_year", say)
+        if name.startswith(col + "_") and (owner is None or len(col) > len(owner)):
+            owner = col
+    if owner:
+        return owner
     for col in ["year", "mileage"]:
         if name == col or name.startswith(col):
             return col
     return name
 
 
-def explain_rows(pipe, X: pd.DataFrame, background: pd.DataFrame):
-    """SHAP values for each row of X, summed back to the 4 original features. Returns (base_value, DataFrame)."""
+def explain_rows(pipe, X: pd.DataFrame, background: pd.DataFrame, features=FEATURES):
+    """SHAP values for each row of X, summed back to the original features. Returns (base_value, DataFrame)."""
     pre = pipe.named_steps["pre"]
     est = pipe.named_steps["model"]
     Xt = pre.transform(X)
@@ -83,9 +90,10 @@ def explain_rows(pipe, X: pd.DataFrame, background: pd.DataFrame):
         values = explainer.shap_values(Xt, nsamples=100, silent=True)
         base = float(np.ravel(explainer.expected_value)[0])
     values = np.asarray(values)
-    grouped = pd.DataFrame(0.0, index=X.index, columns=["shap_" + f for f in FEATURES])
+    text_cols = [f for f in features if f not in NUMERIC]
+    grouped = pd.DataFrame(0.0, index=X.index, columns=["shap_" + f for f in features])
     for j, name in enumerate(names):
-        grouped["shap_" + original_feature(name)] += values[:, j]
+        grouped["shap_" + original_feature(name, text_cols)] += values[:, j]
     return base, grouped
 
 
@@ -119,10 +127,17 @@ def run_once(dry_run: bool = False) -> dict:
         warning = f"model saved with scikit-learn {card['sklearn_version']}, production runs {sklearn.__version__}"
         logging.warning(warning)
 
-    raw = _read_csv(bucket, DATA_KEY, dtype={"post_id": str})
+    features = list(card.get("features") or FEATURES)        # what this model was trained on
+    text_cols = [f for f in features if f not in NUMERIC]
+    data_key = card.get("data_key") or DATA_KEY              # a Gemini model's card points at listings_master_llm.csv
+    raw = _read_csv(bucket, data_key, dtype={"post_id": str})
     if raw is None:
-        return {"status": "error", "error": f"gs://{GCS_BUCKET}/{DATA_KEY} not found (run materialize-master first)"}
-    cars = clean_cars(raw)
+        return {"status": "error", "error": f"gs://{GCS_BUCKET}/{data_key} not found (run materialize-master / materialize-llm first)"}
+    missing = [f for f in features if f not in raw.columns]
+    if missing:
+        return {"status": "error", "error": f"your model needs columns {missing} that {data_key} does not have. "
+                "A Gemini-field model needs data_key = structured/datasets/listings_master_llm.csv in its model card."}
+    cars = clean_cars(raw, text_cols)
 
     preds_key = f"{OUTPUT_PREFIX}/preds_master.csv"
     shap_key = f"{OUTPUT_PREFIX}/shap_master.csv"
@@ -141,10 +156,11 @@ def run_once(dry_run: bool = False) -> dict:
     if len(todo) == 0:
         return {"status": "ok", "new_predictions": 0, "model_version": version, "model_type": model_type, "warning": warning}
 
-    X = todo[FEATURES]
+    X = todo[features]
     y_hat = pipe.predict(X)
-    background = cars[FEATURES].dropna().sample(min(50, len(cars)), random_state=0)
-    base, shap_df = explain_rows(pipe, X, background)
+    usable = cars[features].dropna(subset=NUMERIC)           # text blanks are fine: the model fills them itself
+    background = usable.sample(min(50, len(usable)), random_state=0)
+    base, shap_df = explain_rows(pipe, X, background, features)
 
     now = pd.Timestamp.now(tz="UTC").isoformat()
     preds = todo[["post_id", "scraped_at", "year", "mileage", "make", "model", "price"]].copy()
