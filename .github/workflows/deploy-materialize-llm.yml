@@ -1,4 +1,4 @@
-name: name: Deploy materialize-llm (CF Gen2 + Cloud Scheduler)
+name: Deploy materialize-llm (CF Gen2 + Cloud Scheduler)
 
 on:
   workflow_dispatch:
