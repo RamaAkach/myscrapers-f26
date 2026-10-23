@@ -186,18 +186,103 @@ def _vertex_extract_fields(raw_text: str) -> dict:
             "make": {"type": "string", "nullable": True},
             "model": {"type": "string", "nullable": True},
             "mileage": {"type": "integer", "nullable": True},
+            # A07: New Gemini fields
+"body_type": {
+    "type": "string",
+    "nullable": True,
+    "enum": [
+        "sedan", "suv", "truck", "coupe",
+        "convertible", "hatchback", "wagon",
+        "minivan", "van", "other"
+    ]
+},
+"drivetrain": {
+    "type": "string",
+    "nullable": True,
+    "enum": ["fwd", "rwd", "awd", "4wd"]
+},
+"transmission": {
+    "type": "string",
+    "nullable": True,
+    "enum": ["automatic", "manual"]
+},
+"fuel_type": {
+    "type": "string",
+    "nullable": True,
+    "enum": ["gas", "diesel", "hybrid", "electric"]
+},
+"exterior_color": {
+    "type": "string",
+    "nullable": True,
+    "enum": [
+        "black", "white", "silver", "gray",
+        "blue", "red", "green", "brown",
+        "beige", "gold", "yellow", "orange",
+        "purple", "other"
+    ]
+},
+"title_status": {
+    "type": "string",
+    "nullable": True,
+    "enum": [
+        "clean", "rebuilt", "salvage",
+        "lien", "missing", "parts only"
+    ]
+},
+"condition": {
+    "type": "string",
+    "nullable": True,
+    "enum": [
+        "new", "like new", "excellent",
+        "good", "fair", "salvage"
+    ]
+},
+"leather_seats": {
+    "type": "boolean",
+    "nullable": True
+},
+"accident_history": {
+    "type": "string",
+    "nullable": True,
+    "enum": ["no accidents reported", "accident reported"]
+},
+"backup_camera": {
+    "type": "boolean",
+    "nullable": True
+},
         },
         "required": ["price", "year", "make", "model", "mileage"]
     }
 
     # System instruction (will be prepended to the prompt)
     sys_instr = (
-        "Extract ONLY the following fields from the input text. "
-        "Return a strict JSON object that conforms to the provided schema. "
-        "If a value is not present, use null. "
-        "Rules: integers for price/year/mileage; price in USD; mileage in miles; "
-        "do not infer values not explicitly present; do not add extra keys."
-    )
+    "Extract vehicle information from this Craigslist listing. "
+    "Return a strict JSON object that conforms to the provided schema. "
+    "If a value is not present, use null. "
+    "Rules: integers for price/year/mileage; price in USD; mileage in miles; "
+    "do not infer values not explicitly present unless allowed below; do not add extra keys. "
+
+    # ---- A07: rules for my new fields ----
+    "body_type: you MAY infer it from a well-known make and model "
+    "(for example, a Honda CR-V is an suv). "
+
+    "drivetrain, transmission, fuel_type, exterior_color, title_status, condition: "
+    "use the ad's attribute lines or clear statements in the description; "
+    "a CVT counts as automatic. "
+
+    "leather_seats: true only if the ad mentions leather seats or leather interior, "
+    "false only if it explicitly says cloth seats, otherwise null. "
+
+    "accident_history: return 'accident reported' if the seller mentions an accident "
+    "or collision, and 'no accidents reported' only if the ad explicitly says "
+    "the vehicle has no accident history; otherwise null. "
+
+    "backup_camera: true if the ad explicitly mentions a backup camera "
+    "or rearview camera, false only if the ad explicitly states it does not have one; "
+    "otherwise null. "
+
+    "Do not guess accident history, title status, or equipment based on the vehicle's age. "
+)
 
     # FIX: Combine instruction and text into one prompt string (SDK compatibility)
     prompt = f"{sys_instr}\n\nTEXT:\n{raw_text}"
@@ -346,6 +431,17 @@ def llm_extract_http(request: Request):
                     "make": parsed.get("make"),
                     "model": parsed.get("model"),
                     "mileage": parsed.get("mileage"),
+                    # ---- A07: write my new Gemini fields to the JSONL output ----
+                    "body_type": parsed.get("body_type"),
+                    "drivetrain": parsed.get("drivetrain"),
+                    "transmission": parsed.get("transmission"),
+                    "fuel_type": parsed.get("fuel_type"),
+                    "exterior_color": parsed.get("exterior_color"),
+                    "title_status": parsed.get("title_status"),
+                    "condition": parsed.get("condition"),
+                    "leather_seats": parsed.get("leather_seats"),
+                    "accident_history": parsed.get("accident_history"),
+                    "backup_camera": parsed.get("backup_camera"),
                     "llm_provider": "vertex",
                     "llm_model": LLM_MODEL,
                     "llm_ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
